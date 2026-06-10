@@ -263,6 +263,13 @@ document.addEventListener('keydown',e=>{if(e.key==='Enter')doLogin();});
 </body>
 </html>
 EOF
+    # CentOS/RHEL 上修复 SELinux 上下文，否则 nginx 读取会返回 403
+    if command -v getenforce &>/dev/null && [ "$(getenforce)" != "Disabled" ]; then
+        chcon -R -t httpd_sys_content_t "$WEBROOT" 2>/dev/null && \
+            info "SELinux 上下文已修复: httpd_sys_content_t" || \
+            warn "SELinux 上下文修复失败，若页面返回 403 请手动执行: chcon -R -t httpd_sys_content_t $WEBROOT"
+    fi
+
     info "伪装页面创建完成: $WEBROOT"
 }
 
