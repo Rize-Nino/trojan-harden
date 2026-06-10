@@ -13,6 +13,8 @@ error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
 WEBROOT="/var/www/fake-pan"
 TROJAN_CONFIG="/usr/local/etc/trojan/config.json"
+# 防火墙规则标记，用于识别本脚本添加的规则（不触动其他规则）
+FW_COMMENT="trojan-harden-fakepan"
 
 # ============================================================
 # 检测系统
@@ -23,6 +25,89 @@ detect_os() {
     OS=$ID
     OS_VER=$VERSION_ID
     info "检测到系统: $OS $OS_VER"
+}
+
+# ============================================================
+# 检测防火墙类型
+# ============================================================
+detect_firewall() {
+    if systemctl is-active --quiet ufw 2>/dev/null && command -v ufw &>/dev/null; then
+        FIREWALL="ufw"
+    elif systemctl is-active --quiet firewalld 2>/dev/null && command -v firewall-cmd &>/dev/null; then
+        FIREWALL="firewalld"
+    else
+        FIREWALL="none"
+    fi
+    info "防火墙类型: ${FIREWALL:-none}"
+}
+
+# ============================================================
+# 清理旧部署（幂等）
+# ============================================================
+cleanup_previous() {
+    info "===== 检查并清理旧部署 ====="
+    local cleaned=0
+
+    # 1. 清理 nginx 配置
+    if [ -f /etc/nginx/sites-available/fake-pan ] || \
+       [ -f /etc/nginx/conf.d/fake-pan.conf ]; then
+        warn "发现旧 nginx 配置，清理中..."
+        rm -f /etc/nginx/sites-available/fake-pan
+        rm -f /etc/nginx/sites-enabled/fake-pan
+        rm -f /etc/nginx/conf.d/fake-pan.conf
+        # 重载 nginx（如果在运行）
+        systemctl is-active --quiet nginx 2>/dev/null && \
+            nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null || true
+        cleaned=1
+    fi
+
+    # 2. 清理旧伪装页面
+    if [ -d "$WEBROOT" ]; then
+        warn "发现旧伪装页面目录，清理中: $WEBROOT"
+        rm -rf "$WEBROOT"
+        cleaned=1
+    fi
+
+    # 3. 清理旧防火墙规则（只清理本脚本添加的，通过 comment 标记识别）
+    case "$FIREWALL" in
+        ufw)
+            # 删除带有本脚本注释标记的规则
+            # ufw 不直接支持 comment 查询，通过 numbered 列表匹配
+            if ufw status numbered 2>/dev/null | grep -q "$FW_COMMENT"; then
+                warn "发现旧 ufw 规则，清理中..."
+                # 反向删除（从大到小避免序号偏移）
+                ufw status numbered 2>/dev/null | grep "$FW_COMMENT" | \
+                    grep -oP '^\[\s*\K[0-9]+' | sort -rn | \
+                    while read -r num; do
+                        echo "y" | ufw delete "$num" 2>/dev/null || true
+                    done
+                cleaned=1
+            fi
+            ;;
+        firewalld)
+            # 删除带有本脚本标记的 rich-rule
+            local zone
+            zone=$(firewall-cmd --get-default-zone 2>/dev/null || echo "public")
+            if firewall-cmd --permanent --zone="$zone" --list-rich-rules 2>/dev/null | \
+               grep -q "$FW_COMMENT"; then
+                warn "发现旧 firewalld 规则，清理中..."
+                firewall-cmd --permanent --zone="$zone" --list-rich-rules 2>/dev/null | \
+                    grep "$FW_COMMENT" | \
+                    while IFS= read -r rule; do
+                        firewall-cmd --permanent --zone="$zone" \
+                            --remove-rich-rule="$rule" 2>/dev/null || true
+                    done
+                firewall-cmd --reload 2>/dev/null || true
+                cleaned=1
+            fi
+            ;;
+    esac
+
+    if [ "$cleaned" = "1" ]; then
+        info "旧部署清理完成"
+    else
+        info "未发现旧部署，跳过清理"
+    fi
 }
 
 # ============================================================
@@ -45,26 +130,26 @@ resolve_fallback_port() {
         warn "未找到 trojan 配置，使用默认端口 80"
     fi
 
-    # 检测端口是否被其他进程占用
-    if ss -tlnp 2>/dev/null | grep -q ":${FALLBACK_PORT}[[:space:]]" || \
-       ss -tlnp 2>/dev/null | grep -q ":${FALLBACK_PORT}$"; then
-        OCCUPIED_BY=$(ss -tlnp | grep ":${FALLBACK_PORT}" | grep -oP 'users:\(\("\K[^"]+' | head -1)
-        warn "端口 $FALLBACK_PORT 已被 ${OCCUPIED_BY:-其他进程} 占用"
+    # 检测端口是否被其他进程占用（排除 nginx 自身）
+    local occupier
+    occupier=$(ss -tlnp 2>/dev/null | grep ":${FALLBACK_PORT}[[:space:]\b]" | \
+               grep -oP 'users:\(\("\K[^"]+' | head -1 || true)
+    if [ -n "$occupier" ] && [ "$occupier" != "nginx" ]; then
+        warn "端口 $FALLBACK_PORT 已被 $occupier 占用"
 
         # 自动寻找空闲端口（从 8080 开始）
         NEW_PORT=8080
-        while ss -tlnp 2>/dev/null | grep -q ":${NEW_PORT}[[:space:]]" || \
-              ss -tlnp 2>/dev/null | grep -q ":${NEW_PORT}$"; do
+        while ss -tlnp 2>/dev/null | grep -q ":${NEW_PORT}[[:space:]\b]"; do
             NEW_PORT=$((NEW_PORT + 1))
         done
 
         warn "自动选用空闲端口: $NEW_PORT"
         warn "将修改 trojan config.json: remote_port $FALLBACK_PORT -> $NEW_PORT"
 
-        # 修改 trojan config.json
         if [ -f "$TROJAN_CONFIG" ]; then
             cp "$TROJAN_CONFIG" "${TROJAN_CONFIG}.bak.$(date +%Y%m%d%H%M%S)"
-            sed -i "s/\"remote_port\": ${FALLBACK_PORT}/\"remote_port\": ${NEW_PORT}/" "$TROJAN_CONFIG"
+            sed -i "s/\"remote_port\": ${FALLBACK_PORT}/\"remote_port\": ${NEW_PORT}/" \
+                "$TROJAN_CONFIG"
             TROJAN_CONFIG_CHANGED=1
             info "trojan config.json 已更新（原文件已备份）"
         fi
@@ -196,7 +281,6 @@ configure_nginx() {
         centos|rhel|rocky|almalinux)
             NGINX_CONF="/etc/nginx/conf.d/fake-pan.conf"
             rm -f /etc/nginx/conf.d/default.conf
-            # 注释掉 nginx.conf 里内嵌的 server 块（CentOS 默认有）
             if grep -q 'include /etc/nginx/default\.d' /etc/nginx/nginx.conf 2>/dev/null; then
                 sed -i 's|include /etc/nginx/default\.d/\*\.conf|# &|' /etc/nginx/nginx.conf
             fi
@@ -234,36 +318,47 @@ NGINXEOF
 
 # ============================================================
 # 封锁 fallback 端口外部直连
+# 只添加本脚本专属规则，不触动原有防火墙规则
 # ============================================================
 block_direct_access() {
-    # 80/443 trojan 已独占或为标准端口，不需要封
+    # nginx 只监听 127.0.0.1，外部根本连不到，80/443 更不需要额外封
+    # 但非标准端口在某些系统上 0.0.0.0 也会响应，加一条兜底规则
     if [ "$FALLBACK_PORT" = "80" ] || [ "$FALLBACK_PORT" = "443" ]; then
-        info "标准端口 $FALLBACK_PORT，跳过 iptables 封锁"
+        info "标准端口 $FALLBACK_PORT，无需额外防火墙规则"
         return
     fi
 
-    info "封锁端口 $FALLBACK_PORT 的外部直连"
+    info "添加防火墙规则：封锁端口 $FALLBACK_PORT 的外部直连"
 
-    case "$OS" in
-        debian|ubuntu)
-            iptables -C INPUT -p tcp --dport "$FALLBACK_PORT" ! -s 127.0.0.1 -j DROP 2>/dev/null || \
-                iptables -I INPUT -p tcp --dport "$FALLBACK_PORT" ! -s 127.0.0.1 -j DROP
-            DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent -qq
-            netfilter-persistent save
-            info "iptables 规则已持久化"
+    case "$FIREWALL" in
+        ufw)
+            # 只允许 loopback 访问该端口，拒绝其他来源
+            # 用 comment 标记，便于后续清理，不影响其他规则
+            ufw allow from 127.0.0.1 to any port "$FALLBACK_PORT" proto tcp \
+                comment "$FW_COMMENT"
+            ufw deny from any to any port "$FALLBACK_PORT" proto tcp \
+                comment "$FW_COMMENT"
+            info "ufw 规则已添加（标记: $FW_COMMENT）"
             ;;
-        centos|rhel|rocky|almalinux)
-            if systemctl is-active --quiet firewalld 2>/dev/null; then
-                firewall-cmd --permanent --add-rich-rule="rule family=ipv4 source address=127.0.0.1 port port=${FALLBACK_PORT} protocol=tcp accept"
-                firewall-cmd --permanent --add-rich-rule="rule family=ipv4 port port=${FALLBACK_PORT} protocol=tcp drop"
-                firewall-cmd --reload
-                info "firewalld 规则已添加"
-            else
-                iptables -C INPUT -p tcp --dport "$FALLBACK_PORT" ! -s 127.0.0.1 -j DROP 2>/dev/null || \
-                    iptables -I INPUT -p tcp --dport "$FALLBACK_PORT" ! -s 127.0.0.1 -j DROP
-                iptables-save > /etc/sysconfig/iptables 2>/dev/null || \
-                    warn "iptables 规则已添加但可能未持久化，请手动执行: iptables-save > /etc/sysconfig/iptables"
-            fi
+        firewalld)
+            local zone
+            zone=$(firewall-cmd --get-default-zone 2>/dev/null || echo "public")
+            # rich-rule 里嵌入 comment 标记，便于后续清理
+            # 先放行 loopback，再拒绝其他
+            firewall-cmd --permanent --zone="$zone" --add-rich-rule=\
+"rule family='ipv4' source address='127.0.0.1' \
+port port='${FALLBACK_PORT}' protocol='tcp' \
+log prefix='${FW_COMMENT}' accept"
+            firewall-cmd --permanent --zone="$zone" --add-rich-rule=\
+"rule family='ipv4' \
+port port='${FALLBACK_PORT}' protocol='tcp' \
+log prefix='${FW_COMMENT}' drop"
+            firewall-cmd --reload
+            info "firewalld 规则已添加（标记: $FW_COMMENT，zone: $zone）"
+            ;;
+        none)
+            warn "未检测到 ufw 或 firewalld，跳过防火墙规则"
+            warn "nginx 已绑定 127.0.0.1:${FALLBACK_PORT}，外部无法直连，安全性基本保障"
             ;;
     esac
 }
@@ -288,25 +383,28 @@ restart_trojan_if_needed() {
 verify() {
     echo ""
     info "===== 验证部署 ====="
-    sleep 1  # 等 nginx 完全启动
+    sleep 1
 
-    TITLE=$(curl -s "http://127.0.0.1:${FALLBACK_PORT}/" 2>/dev/null | grep -o '<title>.*</title>' || echo "")
-    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${FALLBACK_PORT}/" 2>/dev/null || echo "000")
+    local title http_code login_code
+    title=$(curl -s "http://127.0.0.1:${FALLBACK_PORT}/" 2>/dev/null | \
+            grep -o '<title>.*</title>' || echo "")
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+                "http://127.0.0.1:${FALLBACK_PORT}/" 2>/dev/null || echo "000")
 
-    if [ "$HTTP_CODE" = "200" ] && echo "$TITLE" | grep -q "文件管理系统"; then
-        info "✓ 伪装页面响应正常: $TITLE"
+    if [ "$http_code" = "200" ] && echo "$title" | grep -q "文件管理系统"; then
+        info "✓ 伪装页面响应正常: $title"
     else
-        warn "伪装页面响应异常 (HTTP $HTTP_CODE)，检查: journalctl -u nginx -n 20"
+        warn "伪装页面响应异常 (HTTP $http_code)，检查: journalctl -u nginx -n 20"
     fi
 
-    LOGIN_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+    login_code=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
         "http://127.0.0.1:${FALLBACK_PORT}/api/login" \
         -H 'Content-Type: application/json' \
         -d '{"username":"test","password":"test"}' 2>/dev/null || echo "000")
-    if [ "$LOGIN_CODE" = "200" ]; then
+    if [ "$login_code" = "200" ]; then
         info "✓ 登录接口正常（始终返回失败）"
     else
-        warn "登录接口响应异常 (HTTP $LOGIN_CODE)"
+        warn "登录接口响应异常 (HTTP $login_code)"
     fi
 }
 
@@ -324,6 +422,8 @@ main() {
     echo ""
 
     detect_os
+    detect_firewall
+    cleanup_previous
     resolve_fallback_port "$1"
     disable_trojan_web
     install_nginx
@@ -339,6 +439,7 @@ main() {
     info "========================================="
     echo ""
     echo "  nginx fallback 端口 : $FALLBACK_PORT"
+    echo "  防火墙类型          : $FIREWALL"
     echo "  trojan 配置文件     : $TROJAN_CONFIG"
     echo "  伪装页面目录        : $WEBROOT"
     echo "  nginx 访问日志      : /var/log/nginx/access.log"
