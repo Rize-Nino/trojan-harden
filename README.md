@@ -1,16 +1,15 @@
-此脚本非独立项目，仅为解决Jrohy老师脚本存在的安全性问题的方案。
+### 此脚本非独立项目，仅为解决Jrohy老师脚本存在的安全性问题的方案。
 
-本脚本可将原版web管理页面替换成一个假的登入界面（可通过脚本复原），亦可替换使用修复安全问题后重新编译的web管理页面（不可逆）。
+## 本脚本可将原版web管理页面替换成一个假的登入界面（可通过脚本复原），亦可替换使用修复安全问题后重新编译的web管理页面（不可逆）。
 
-重新编译后的web管理页面，会在已存在管理员的情况下，拒绝对/auth/register的访问，返回403。
+## 重新编译后的web管理页面，会在已存在管理员的情况下，拒绝对/auth/register的访问，返回403。
 
 针对Web管理面板，总会有漏洞存在，本脚本意义在于根绝后续可能再次出现的此种漏洞。
 对于Jrohy老师制作的脚本，在shell页面已经能够很方便地管理用户，所以仅使用密钥通过SSH连接进行管理，是一种更安全的方式。
 然而，关掉管理面板后，Trojan端口便失去了伪装，故在此建立一个“网盘登入入口”进行伪装，但实际上这个登录页面并不对应到任何服务，也无法进入到任何地方，只会返回“密码错误“的结果，用于迷惑各种不怀好意的访问。
 
-'''
-使用方式：wget https://raw.githubusercontent.com/Rize-Nino/trojan-harden/refs/heads/main/trojan-harden.sh && bash trojan-harden.sh
-'''
+# 使用方式：
+'wget https://raw.githubusercontent.com/Rize-Nino/trojan-harden/refs/heads/main/trojan-harden.sh && bash trojan-harden.sh'
 
 Jrohy老师脚本：https://github.com/Jrohy/trojan
 
