@@ -8,7 +8,9 @@
 对于Jrohy老师制作的脚本，在shell页面已经能够很方便地管理用户，所以仅使用密钥通过SSH连接进行管理，是一种更安全的方式。
 然而，关掉管理面板后，Trojan端口便失去了伪装，故在此建立一个“网盘登入入口”进行伪装，但实际上这个登录页面并不对应到任何服务，也无法进入到任何地方，只会返回“密码错误“的结果，用于迷惑各种不怀好意的访问。
 
+'''
 使用方式：wget https://raw.githubusercontent.com/Rize-Nino/trojan-harden/refs/heads/main/trojan-harden.sh && bash trojan-harden.sh
+'''
 
 Jrohy老师脚本：https://github.com/Jrohy/trojan
 
